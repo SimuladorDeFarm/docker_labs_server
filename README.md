@@ -28,7 +28,7 @@ Con **macvlan**, el contenedor aparece en tu LAN como una máquina física más,
 Clona el repo y coloca el script en tu `PATH`:
 
 ```bash
-git clone <URL-de-tu-repo> docker_labs_server
+git clone https://github.com/SimuladorDeFarm/docker_labs_server docker_labs_server
 cd docker_labs_server
 chmod +x autostarlab
 sudo install -m 755 autostarlab /usr/local/bin/autostarlab
