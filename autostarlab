@@ -1,0 +1,247 @@
+#!/usr/bin/env bash
+#
+# autostarlab - Despliega un lab de DockerLabs y le asigna una IP propia en tu
+#               LAN (via macvlan) para poder atacarlo desde otra maquina como si
+#               fuera una caja de HTB: todos los puertos accesibles, sin chocar
+#               con los servicios reales del host (p.ej. su SSH).
+#
+# Se ejecuta EN EL PROPIO SERVIDOR Docker (te conectas por SSH, haces wget del
+# .tar del lab en la carpeta que contiene auto_deploy.sh, y lanzas autostarlab).
+#
+# Repo: docker_labs_server
+# Autor: simuladordefarm
+# Licencia: MIT
+#
+set -euo pipefail
+
+VERSION="1.0.0"
+PROG="autostarlab"
+
+# ----------------------------- Valores por defecto ---------------------------
+NET_NAME="labnet"          # nombre de la red macvlan (se crea si no existe)
+ADDR=""                    # IP a asignar; vacio = auto (primera libre .200+)
+IFACE=""                   # interfaz padre; vacio = autodeteccion (cableada)
+TAR=""                     # tar a desplegar; vacio = el unico .tar del dir
+DEPLOY=""                  # ruta a auto_deploy.sh; vacio = <dir>/auto_deploy.sh
+DIR="."                    # carpeta con auto_deploy.sh y el .tar (def: actual)
+DO_STOP=0                  # -s : elimina el lab en vez de desplegarlo
+# -----------------------------------------------------------------------------
+
+c_red=$'\e[1;31m'; c_grn=$'\e[1;32m'; c_yel=$'\e[1;33m'; c_cya=$'\e[1;36m'; c_rst=$'\e[0m'
+info(){ echo "${c_cya}[*]${c_rst} $*"; }
+ok(){   echo "${c_grn}[+]${c_rst} $*"; }
+warn(){ echo "${c_yel}[!]${c_rst} $*" >&2; }
+die(){  echo "${c_red}[x]${c_rst} $*" >&2; exit 1; }
+
+usage(){
+cat <<EOF
+${PROG} v${VERSION} - despliega un lab DockerLabs con IP propia en la LAN (macvlan)
+
+USO:
+  ${PROG} [OPCIONES] [CARPETA]
+
+  CARPETA  Carpeta que contiene auto_deploy.sh y el .tar del lab.
+           Si se omite, se usa la carpeta actual.
+
+OPCIONES:
+  -t, --tar FICHERO     .tar a desplegar (por defecto: el unico .tar de la carpeta)
+  -a, --addr IP         IP fija a asignar en la LAN (por defecto: primera libre desde .200)
+  -i, --iface IFAZ      Interfaz padre para la macvlan (por defecto: cableada autodetectada)
+  -n, --network NOMBRE  Nombre de la red macvlan (por defecto: ${NET_NAME})
+      --deploy RUTA     Ruta a auto_deploy.sh (por defecto: CARPETA/auto_deploy.sh)
+  -s, --stop            Elimina el lab (para el contenedor y libera la IP)
+  -h, --help            Muestra esta ayuda
+  -V, --version         Muestra la version
+
+EJEMPLOS:
+  cd ~/docker_labs && wget URL/milab.tar && ${PROG}     # despliega en la carpeta actual
+  ${PROG} ~/docker_labs                                  # despliega el lab de esa carpeta
+  ${PROG} -a 192.168.1.210 ~/docker_labs                 # con IP fija concreta
+  ${PROG} -t milab.tar ~/docker_labs                     # si hay varios .tar
+  ${PROG} -s ~/docker_labs                               # elimina el lab desplegado
+
+NOTAS:
+  * Necesita root: si no lo eres, se re-ejecuta con sudo automaticamente.
+  * macvlan NO funciona sobre WiFi; usa la interfaz cableada (autodetectado).
+  * Por diseno de macvlan el PROPIO host NO ve al contenedor: ataca/navega
+    SIEMPRE desde OTRA maquina de la red (tu laptop), nunca desde este servidor.
+EOF
+}
+
+# ------------------------------- Parseo de args ------------------------------
+POSITIONAL=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -t|--tar)     TAR="${2:?falta valor para $1}"; shift 2 ;;
+    -a|--addr)    ADDR="${2:?falta valor para $1}"; shift 2 ;;
+    -i|--iface)   IFACE="${2:?falta valor para $1}"; shift 2 ;;
+    -n|--network) NET_NAME="${2:?falta valor para $1}"; shift 2 ;;
+    --deploy)     DEPLOY="${2:?falta valor para $1}"; shift 2 ;;
+    -s|--stop)    DO_STOP=1; shift ;;
+    -h|--help)    usage; exit 0 ;;
+    -V|--version) echo "${PROG} v${VERSION}"; exit 0 ;;
+    --)           shift; while [ $# -gt 0 ]; do POSITIONAL+=("$1"); shift; done ;;
+    -*)           die "Opcion desconocida: $1  (usa -h para ayuda)" ;;
+    *)            POSITIONAL+=("$1"); shift ;;
+  esac
+done
+[ "${#POSITIONAL[@]}" -gt 1 ] && die "Solo se admite una CARPETA. Usa -h."
+[ "${#POSITIONAL[@]}" -eq 1 ] && DIR="${POSITIONAL[0]}"
+
+# ------------------------------- Root / sudo ---------------------------------
+if [ "$(id -u)" -ne 0 ]; then
+  info "Se requieren privilegios de root; re-ejecutando con sudo..."
+  exec sudo -E bash "$0" \
+    ${TAR:+--tar "$TAR"} ${ADDR:+--addr "$ADDR"} ${IFACE:+--iface "$IFACE"} \
+    --network "$NET_NAME" ${DEPLOY:+--deploy "$DEPLOY"} \
+    $([ "$DO_STOP" -eq 1 ] && echo --stop) "$DIR"
+fi
+
+command -v docker >/dev/null || die "Docker no esta instalado en este servidor."
+
+# ------------------------- Resolver carpeta y ficheros -----------------------
+[ -d "$DIR" ] || die "La carpeta no existe: $DIR"
+DIR="$(cd "$DIR" && pwd)"                       # ruta absoluta
+[ -z "$DEPLOY" ] && DEPLOY="$DIR/auto_deploy.sh"
+[ -f "$DEPLOY" ] || die "No encuentro auto_deploy.sh en '$DIR' (usa --deploy RUTA)."
+
+# Resolver el .tar
+if [ -z "$TAR" ]; then
+  mapfile -t TARS < <(find "$DIR" -maxdepth 1 -name '*.tar' -printf '%f\n' | sort)
+  case "${#TARS[@]}" in
+    0) die "No hay ningun .tar en '$DIR'. Descarga el lab (wget) o usa --tar." ;;
+    1) TAR="${TARS[0]}" ;;
+    *) die "Hay varios .tar en '$DIR': ${TARS[*]}. Elige con -t NOMBRE.tar" ;;
+  esac
+fi
+# Normalizar: TAR puede venir con ruta; nos quedamos con la base y el fichero
+TAR_PATH="$TAR"; [ -f "$TAR_PATH" ] || TAR_PATH="$DIR/$(basename "$TAR")"
+[ -f "$TAR_PATH" ] || die "No encuentro el tar: $TAR"
+BASE="$(basename "$TAR_PATH" .tar)"
+CONT="${BASE}_container"
+
+# ------------------------------- Modo STOP -----------------------------------
+if [ "$DO_STOP" -eq 1 ]; then
+  info "Eliminando lab '${BASE}'..."
+  docker network disconnect -f "$NET_NAME" "$CONT" 2>/dev/null || true
+  pkill -INT -f "auto_deploy.sh" 2>/dev/null || true   # deja que auto_deploy limpie (trap INT)
+  sleep 2
+  docker rm -f "$CONT" 2>/dev/null || true
+  ok "Lab '${BASE}' eliminado."
+  exit 0
+fi
+
+# --------------------------- Autodeteccion de red ----------------------------
+is_wireless(){ [ -d "/sys/class/net/$1/wireless" ]; }
+
+detect_iface(){
+  local def
+  def="$(ip -o route show default 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev") print $(i+1)}' | head -1)"
+  if [ -n "$def" ] && ! is_wireless "$def"; then echo "$def"; return; fi
+  local i
+  for i in /sys/class/net/*; do
+    i="$(basename "$i")"
+    [ "$i" = "lo" ] && continue
+    is_wireless "$i" && continue
+    case "$i" in docker*|br-*|veth*|virbr*|tun*|tap*|bond*) continue ;; esac
+    if ip -4 -o addr show dev "$i" scope global 2>/dev/null | grep -q inet; then echo "$i"; return; fi
+  done
+  echo "$def"   # ultimo recurso (aunque sea wifi)
+}
+
+[ -z "$IFACE" ] && IFACE="$(detect_iface)"
+[ -n "$IFACE" ] || die "No pude detectar una interfaz de red. Especifica con -i IFAZ."
+is_wireless "$IFACE" && warn "La interfaz '$IFACE' parece WiFi; macvlan casi nunca funciona sobre WiFi. Usa -i con la cableada."
+
+SUBNET="$(ip -o -f inet route show scope link dev "$IFACE" 2>/dev/null | awk '{print $1}' | grep -m1 '/')"
+GATEWAY="$(ip -o -f inet route show default 2>/dev/null | awk -v d="$IFACE" '$0 ~ ("dev "d){print $3; exit}')"
+[ -z "$GATEWAY" ] && GATEWAY="$(ip -o -f inet route show default 2>/dev/null | awk '{print $3; exit}')"
+[ -n "$SUBNET" ]  || die "No pude determinar la subred de '$IFACE'. Revisa la red o usa -i."
+[ -n "$GATEWAY" ] || die "No pude determinar el gateway. Revisa la red."
+
+# ------------------------------ Elegir la IP ---------------------------------
+pick_free_ip(){
+  local net prefix h ip
+  net="${SUBNET%/*}"; prefix="${net%.*}"      # 192.168.1.0/24 -> 192.168.1
+  for h in $(seq 200 250) $(seq 150 199); do
+    ip="$prefix.$h"
+    ping -c1 -W1 "$ip" >/dev/null 2>&1 || { echo "$ip"; return 0; }
+  done
+  return 1
+}
+if [ -z "$ADDR" ]; then
+  ADDR="$(pick_free_ip)" || die "No encontre ninguna IP libre en $SUBNET."
+fi
+
+info "Interfaz padre : $IFACE"
+info "Subred/Gateway : $SUBNET / $GATEWAY"
+info "Red macvlan    : $NET_NAME"
+info "IP del lab     : $ADDR"
+info "Lab (tar)      : $TAR_PATH"
+
+# ------------------------- Crear red macvlan (idempotente) -------------------
+if ! docker network inspect "$NET_NAME" >/dev/null 2>&1; then
+  info "Creando red macvlan '$NET_NAME' sobre $IFACE..."
+  docker network create -d macvlan \
+    --subnet="$SUBNET" --gateway="$GATEWAY" \
+    -o parent="$IFACE" "$NET_NAME" >/dev/null
+  ok "Red '$NET_NAME' creada."
+else
+  info "Red '$NET_NAME' ya existe; se reutiliza."
+fi
+
+# --------------------- Lanzar auto_deploy.sh (detachado) ---------------------
+# auto_deploy.sh NO termina (se queda en 'while true' para su trap Ctrl+C), asi
+# que lo lanzamos detachado y esperamos a que el contenedor arranque.
+LOG="/tmp/${PROG}_${BASE}.log"
+info "Desplegando '${BASE}' (docker load puede tardar)..."
+( cd "$DIR" && exec setsid bash "$DEPLOY" "$(basename "$TAR_PATH")" >"$LOG" 2>&1 </dev/null ) &
+disown 2>/dev/null || true
+
+running=""
+for _ in $(seq 1 120); do
+  running="$(docker inspect -f '{{.State.Running}}' "$CONT" 2>/dev/null || true)"
+  [ "$running" = "true" ] && break
+  sleep 2
+done
+[ "$running" = "true" ] || { warn "El contenedor '$CONT' no arranco. Log: $LOG"; tail -n 20 "$LOG" 2>/dev/null; exit 1; }
+ok "Contenedor '$CONT' en marcha."
+
+# auto_deploy.sh no termina (bucle infinito a la espera de Ctrl+C). Ya no lo
+# necesitamos: lo terminamos con SIGTERM (NO con INT) para que el contenedor siga
+# vivo y no se acumulen procesos zombis en cada despliegue.
+pkill -TERM -f "auto_deploy.sh.*$(basename "$TAR_PATH")" 2>/dev/null || true
+
+# --------------------------- Conectar a la macvlan ---------------------------
+info "Asignando IP $ADDR en la red '$NET_NAME'..."
+# Limpia cualquier endpoint 'stale' con el mismo nombre (de una instancia previa)
+docker network disconnect -f "$NET_NAME" "$CONT" 2>/dev/null || true
+if ! docker network connect "$NET_NAME" "$CONT" --ip "$ADDR" 2>"/tmp/${PROG}_connect.err"; then
+  warn "No pude asignar $ADDR ($(cat "/tmp/${PROG}_connect.err" 2>/dev/null)); intento con IP automatica..."
+  docker network disconnect -f "$NET_NAME" "$CONT" 2>/dev/null || true
+  docker network connect "$NET_NAME" "$CONT" 2>/dev/null \
+    || die "No pude conectar '$CONT' a '$NET_NAME'. Revisa: docker network inspect $NET_NAME"
+fi
+LABIP="$(docker inspect -f "{{with (index .NetworkSettings.Networks \"$NET_NAME\")}}{{.IPAddress}}{{end}}" "$CONT" 2>/dev/null || true)"
+[ -n "$LABIP" ] || die "El contenedor no quedo conectado a '$NET_NAME'."
+
+# ------------------------- Puertos abiertos (pista) --------------------------
+BRIDGE_IP="$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}} {{end}}' "$CONT" | awk '{print $1}')"
+PORTS=""
+if command -v nmap >/dev/null 2>&1 && [ -n "$BRIDGE_IP" ]; then
+  PORTS="$(nmap -Pn -T4 -F --open "$BRIDGE_IP" 2>/dev/null | awk '/^[0-9]+\/tcp/{print $1}' | paste -sd, -)"
+fi
+
+# --------------------------------- Resumen -----------------------------------
+echo
+echo "${c_grn}==================================================================${c_rst}"
+echo "  Lab '${BASE}' LISTO"
+echo "  IP objetivo (LAN) : ${c_grn}${LABIP}${c_rst}"
+[ -n "$PORTS" ] && echo "  Puertos abiertos  : ${PORTS}"
+echo
+echo "  Desde OTRA maquina de la red (tu laptop, NO este servidor):"
+echo "     nmap -p- -sV ${LABIP}"
+echo "     (si hay web)  http://${LABIP}/"
+echo
+echo "  Para eliminarlo:   ${PROG} -s${TAR:+ -t $(basename "$TAR_PATH")} \"${DIR}\""
+echo "${c_grn}==================================================================${c_rst}"
