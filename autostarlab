@@ -14,7 +14,7 @@
 #
 set -euo pipefail
 
-VERSION="1.0.0"
+VERSION="1.1.0"
 PROG="autostarlab"
 
 # ----------------------------- Valores por defecto ---------------------------
@@ -35,7 +35,7 @@ die(){  echo "${c_red}[x]${c_rst} $*" >&2; exit 1; }
 
 usage(){
 cat <<EOF
-${PROG} v${VERSION} - despliega un lab DockerLabs con IP propia en la LAN (macvlan)
+${PROG} v${VERSION} - despliega un lab DockerLabs con IP propia en la LAN (macvlan/ipvlan)
 
 USO:
   ${PROG} [OPCIONES] [CARPETA]
@@ -46,8 +46,8 @@ USO:
 OPCIONES:
   -t, --tar FICHERO     .tar a desplegar (por defecto: el unico .tar de la carpeta)
   -a, --addr IP         IP fija a asignar en la LAN (por defecto: primera libre desde .200)
-  -i, --iface IFAZ      Interfaz padre para la macvlan (por defecto: cableada autodetectada)
-  -n, --network NOMBRE  Nombre de la red macvlan (por defecto: ${NET_NAME})
+  -i, --iface IFAZ      Interfaz padre (por defecto: cableada autodetectada; si no hay, WiFi)
+  -n, --network NOMBRE  Nombre de la red (por defecto: ${NET_NAME})
       --deploy RUTA     Ruta a auto_deploy.sh (por defecto: CARPETA/auto_deploy.sh)
   -s, --stop            Elimina el lab (para el contenedor y libera la IP)
   -h, --help            Muestra esta ayuda
@@ -62,9 +62,11 @@ EJEMPLOS:
 
 NOTAS:
   * Necesita root: si no lo eres, se re-ejecuta con sudo automaticamente.
-  * macvlan NO funciona sobre WiFi; usa la interfaz cableada (autodetectado).
-  * Por diseno de macvlan el PROPIO host NO ve al contenedor: ataca/navega
-    SIEMPRE desde OTRA maquina de la red (tu laptop), nunca desde este servidor.
+  * Usa cable si hay enlace activo (macvlan); si solo hay WiFi, usa ipvlan L2
+    automaticamente (macvlan no funciona sobre WiFi).
+  * Por diseno de macvlan/ipvlan el PROPIO host NO ve al contenedor por esa IP:
+    ataca/navega SIEMPRE desde OTRA maquina de la red (tu laptop), nunca desde
+    este servidor.
 EOF
 }
 
@@ -133,25 +135,42 @@ fi
 
 # --------------------------- Autodeteccion de red ----------------------------
 is_wireless(){ [ -d "/sys/class/net/$1/wireless" ]; }
+has_link(){ [ "$(cat "/sys/class/net/$1/carrier" 2>/dev/null)" = "1" ]; }
 
+# Preferencia: cable CON enlace > cualquier otra con IP global > la de la ruta
+# por defecto (aunque sea wifi, como ultimo recurso).
 detect_iface(){
-  local def
+  local def i
   def="$(ip -o route show default 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev") print $(i+1)}' | head -1)"
-  if [ -n "$def" ] && ! is_wireless "$def"; then echo "$def"; return; fi
-  local i
+
+  # 1) cualquier interfaz cableada con enlace fisico activo
   for i in /sys/class/net/*; do
     i="$(basename "$i")"
     [ "$i" = "lo" ] && continue
     is_wireless "$i" && continue
     case "$i" in docker*|br-*|veth*|virbr*|tun*|tap*|bond*) continue ;; esac
-    if ip -4 -o addr show dev "$i" scope global 2>/dev/null | grep -q inet; then echo "$i"; return; fi
+    has_link "$i" && { echo "$i"; return; }
   done
-  echo "$def"   # ultimo recurso (aunque sea wifi)
+
+  # 2) la de la ruta por defecto, si tiene enlace (cable sin IP o wifi conectado)
+  if [ -n "$def" ] && has_link "$def"; then echo "$def"; return; fi
+
+  # 3) ultimo recurso: la ruta por defecto aunque no detectemos carrier (p.ej. wifi)
+  echo "$def"
 }
 
 [ -z "$IFACE" ] && IFACE="$(detect_iface)"
 [ -n "$IFACE" ] || die "No pude detectar una interfaz de red. Especifica con -i IFAZ."
-is_wireless "$IFACE" && warn "La interfaz '$IFACE' parece WiFi; macvlan casi nunca funciona sobre WiFi. Usa -i con la cableada."
+has_link "$IFACE" || warn "La interfaz '$IFACE' no reporta enlace activo (cable desconectado?); continuo igual."
+
+if is_wireless "$IFACE"; then
+  DRIVER="ipvlan"
+  DRV_OPTS=(-o ipvlan_mode=l2)
+  warn "'$IFACE' es WiFi: uso ipvlan (modo L2) en vez de macvlan, que no funciona sobre WiFi."
+else
+  DRIVER="macvlan"
+  DRV_OPTS=()
+fi
 
 SUBNET="$(ip -o -f inet route show scope link dev "$IFACE" 2>/dev/null | awk '{print $1}' | grep -m1 '/')"
 GATEWAY="$(ip -o -f inet route show default 2>/dev/null | awk -v d="$IFACE" '$0 ~ ("dev "d){print $3; exit}')"
@@ -173,21 +192,35 @@ if [ -z "$ADDR" ]; then
   ADDR="$(pick_free_ip)" || die "No encontre ninguna IP libre en $SUBNET."
 fi
 
-info "Interfaz padre : $IFACE"
+info "Interfaz padre : $IFACE ($DRIVER)"
 info "Subred/Gateway : $SUBNET / $GATEWAY"
-info "Red macvlan    : $NET_NAME"
+info "Red (${DRIVER}) : $NET_NAME"
 info "IP del lab     : $ADDR"
 info "Lab (tar)      : $TAR_PATH"
 
-# ------------------------- Crear red macvlan (idempotente) -------------------
-if ! docker network inspect "$NET_NAME" >/dev/null 2>&1; then
-  info "Creando red macvlan '$NET_NAME' sobre $IFACE..."
-  docker network create -d macvlan \
+# ------------------------- Crear red (idempotente) ---------------------------
+net_create(){
+  info "Creando red $DRIVER '$NET_NAME' sobre $IFACE..."
+  docker network create -d "$DRIVER" "${DRV_OPTS[@]}" \
     --subnet="$SUBNET" --gateway="$GATEWAY" \
     -o parent="$IFACE" "$NET_NAME" >/dev/null
   ok "Red '$NET_NAME' creada."
+}
+
+if docker network inspect "$NET_NAME" >/dev/null 2>&1; then
+  cur_drv="$(docker network inspect "$NET_NAME" -f '{{.Driver}}')"
+  cur_par="$(docker network inspect "$NET_NAME" -f '{{index .Options "parent"}}')"
+  if [ "$cur_drv" = "$DRIVER" ] && [ "$cur_par" = "$IFACE" ]; then
+    info "Red '$NET_NAME' ya existe ($cur_drv sobre $cur_par); se reutiliza."
+  else
+    warn "La red '$NET_NAME' existente es $cur_drv sobre '$cur_par', no $DRIVER sobre '$IFACE'; la recreo."
+    busy="$(docker network inspect "$NET_NAME" -f '{{range .Containers}}{{.Name}} {{end}}')"
+    [ -z "$busy" ] || die "Hay contenedores conectados a '$NET_NAME' ($busy). Eliminalos primero con: $PROG -s"
+    docker network rm "$NET_NAME" >/dev/null
+    net_create
+  fi
 else
-  info "Red '$NET_NAME' ya existe; se reutiliza."
+  net_create
 fi
 
 # --------------------- Lanzar auto_deploy.sh (detachado) ---------------------
